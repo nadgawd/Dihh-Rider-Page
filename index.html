@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dihh Rider — Ride-away pass</title>
+<!--
+  Dihh Rider · RIDE-AWAY page (no app for the rider, owner stays in control)
+
+  Host this single file on any free HTTPS host (GitHub Pages, Netlify,
+  Cloudflare Pages) and put its URL in the owner's app (Me → Rider links →
+  Ride-away page address). The owner shares a link like:
+      https://your-host/ride/#p=<passId>.<passSecret>
+  The secret stays after the "#" — it is never sent to the hosting server.
+
+  How ownership survives: this page can talk Bluetooth to the bike, but it
+  will NOT unlock until the rider pastes a one-bike, expiring approval code
+  that only the owner's phone can mint (HMAC-SHA256 keyed with the pass
+  secret, which lives in the owner's phone keystore). When the approval
+  expires, this page locks the bike itself and stops. Owner can also just
+  never issue a code, revoke the pass, or block the rider in the app.
+
+  Browser reality: Web Bluetooth works in Chrome on Android/Windows/Mac.
+  It does NOT work on iPhone (Apple blocks it in every iOS browser), and
+  the page must be served over HTTPS. Keep this tab open and the screen
+  awake while riding — if the browser is killed, keep-alive stops.
+-->
+<style>
+body{font-family:system-ui;background:#F0F2F5;margin:0;padding:18px;color:#050505}
+.card{background:#fff;border:3px solid #1877F2;border-radius:24px;padding:18px;max-width:520px;margin:14px auto}
+h1{color:#1877F2;margin:4px 0}button{background:#1877F2;color:#fff;border:3px solid #0F5FCC;border-bottom-width:7px;border-radius:999px;padding:14px 18px;font-weight:900;font-size:16px;width:100%;margin:8px 0}
+button.green{background:#42B72A;border-color:#2E8B1E}button.sun{background:#FFC531;border-color:#E0A800;color:#050505}button.red{background:#D92D20;border-color:#A61F16}
+button:disabled{opacity:.45}
+textarea,input{width:100%;padding:13px;border:3px solid #CCD0D5;border-radius:14px;font-size:15px;box-sizing:border-box}
+.pill{display:inline-block;background:#FFC531;border-radius:999px;padding:6px 12px;font-weight:800}
+.dim{color:#65676B}.big{font-size:26px;font-weight:900;color:#1877F2}.err{color:#D92D20;font-weight:700}
+</style>
+</head>
+<body>
+<div class="card">
+  <div style="font-size:44px">🚲</div>
+  <h1>Dihh Rider — ride-away pass</h1>
+  <p class="dim">No app needed. Your browser talks to the bike directly, but only with the owner's approval code — and only until it expires.</p>
+  <p id="support" class="err"></p>
+  <p id="passinfo">Reading your pass…</p>
+
+  <p><b>1.</b> Connect to your bike (Bluetooth chooser):</p>
+  <button id="choose">🔍 Choose bike</button>
+  <p id="bikeinfo" class="dim">No bike connected yet.</p>
+
+  <p><b>2.</b> That's it — connecting sends your request to the owner automatically. His approval arrives here by itself and the bike unlocks. (Button below only if you need to ask again:)</p>
+  <button class="sun" id="ask" disabled>↻ Ask owner again</button>
+  <textarea id="reqout" rows="3" readonly placeholder="Your request will appear here if sharing is unavailable"></textarea>
+  <p class="dim">Send that to the owner (WhatsApp etc.). He taps the dihh-rider:// link in it — your bike pops up in his app — or he pastes the DIHH-REQ1 code there.</p>
+
+  <p class="dim">Backup: if the owner sends you an approval code manually, paste it here:</p>
+  <textarea id="code" rows="3" placeholder="DIHH-AWAY1.…"></textarea>
+  <button id="verify">✅ Check approval code</button>
+  <p id="codeinfo" class="dim"></p>
+
+  <p><b>3.</b> Ride:</p>
+  <button class="green" id="unlock" disabled>🔓 Unlock</button>
+  <button class="sun" id="pause" disabled>⏸️ Pause ride</button>
+  <button class="red" id="end" disabled>🏁 Stop ride</button>
+  <p id="state" class="big"></p>
+  <p id="tele" class="dim"></p>
+  <p class="dim">⚠️ Keep this tab open and your screen awake while riding. If the browser dies, the bike stops getting keep-alive pulses and will lock.</p>
+</div>
+
+<script>
+'use strict';
+/* ============ tiny helpers ============ */
+const $ = id => document.getElementById(id);
+const ascii = s => Uint8Array.from([...s].map(c => c.charCodeAt(0) & 0xff));
+const toAscii = b => [...b].map(x => String.fromCharCode(x)).join('');
+const hex = b => [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+function b64urlDecode(s){ s = s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin = atob(s); return Uint8Array.from([...bin].map(c=>c.charCodeAt(0))); }
+
+/* ============ AES-128 + CCM/CTR (same crypto as the owner's app) ============ */
+const SBOX = new Uint8Array([0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16]);
+const RCON = [1,2,4,8,16,32,64,128,27,54];
+const xtime = x => ((x<<1) ^ (x&0x80?0x1b:0)) & 0xff;
+function expandKey(key){ const w = new Uint8Array(176); w.set(key); for(let i=4;i<44;i++){ let t=[w[(i-1)*4],w[(i-1)*4+1],w[(i-1)*4+2],w[(i-1)*4+3]]; if(i%4===0) t=[SBOX[t[1]]^RCON[i/4-1],SBOX[t[2]],SBOX[t[3]],SBOX[t[0]]]; for(let j=0;j<4;j++) w[i*4+j]=w[(i-4)*4+j]^t[j]; } return w; }
+function aesBlock(block,key){ const rk=expandKey(key); const s=Uint8Array.from(block); const add=r=>{for(let i=0;i<16;i++)s[i]^=rk[r*16+i]}; add(0);
+  for(let round=1;round<=10;round++){ for(let i=0;i<16;i++)s[i]=SBOX[s[i]]; const t=Uint8Array.from(s);
+    for(let r=0;r<4;r++)for(let c=0;c<4;c++)s[r+4*c]=t[r+4*((c+r)%4)];
+    if(round<10) for(let c=0;c<4;c++){ const a0=s[4*c],a1=s[4*c+1],a2=s[4*c+2],a3=s[4*c+3];
+      s[4*c]=xtime(a0)^(xtime(a1)^a1)^a2^a3; s[4*c+1]=a0^xtime(a1)^(xtime(a2)^a2)^a3; s[4*c+2]=a0^a1^xtime(a2)^(xtime(a3)^a3); s[4*c+3]=(xtime(a0)^a0)^a1^a2^xtime(a3); }
+    add(round); } return s; }
+const xorB=(a,b)=>Uint8Array.from(a.map((x,i)=>x^b[i]));
+function aesCtr(key,nonce,data){ const out=new Uint8Array(data.length); const L=15-nonce.length;
+  for(let block=0,off=0;off<data.length;block++,off+=16){ const ctr=new Uint8Array(16); ctr[0]=L-1; ctr.set(nonce,1); let c=block+1;
+    for(let i=15;i>15-L;i--){ctr[i]=c&0xff;c>>=8;} const ks=aesBlock(ctr,key);
+    for(let i=0;i<Math.min(16,data.length-off);i++) out[off+i]=data[off+i]^ks[i]; } return out; }
+function aesCcm(key,nonce,aad,plain,tagLen){ tagLen=tagLen||4; const L=15-nonce.length;
+  const b0=new Uint8Array(16); b0[0]=(aad.length?0x40:0)|(((tagLen-2)/2)<<3)|(L-1); b0.set(nonce,1); let m=plain.length;
+  for(let i=15;i>15-L;i--){b0[i]=m&0xff;m>>=8;}
+  let x=aesBlock(b0,key);
+  const feed=bytes=>{ for(let off=0;off<bytes.length;off+=16){ const blk=new Uint8Array(16); blk.set(bytes.subarray(off,off+16)); x=aesBlock(xorB(x,blk),key);} };
+  if(aad.length){ const enc=new Uint8Array(2+aad.length); enc[0]=(aad.length>>8)&0xff; enc[1]=aad.length&0xff; enc.set(aad,2); feed(enc); }
+  feed(plain);
+  const ctr0=new Uint8Array(16); ctr0[0]=L-1; ctr0.set(nonce,1); const s0=aesBlock(ctr0,key);
+  const ct=aesCtr(key,nonce,plain); const out=new Uint8Array(ct.length+tagLen); out.set(ct);
+  for(let i=0;i<tagLen;i++) out[ct.length+i]=x[i]^s0[i]; return out; }
+function crc16(data){ let crc=0xffff; for(const byte of data){ crc=(((crc<<8)|(crc>>8))&0xffff)^(byte&0xff); crc^=(crc&0xff)>>4; crc^=(crc<<12)&0xffff; crc^=(crc&0xff)<<5; crc&=0xffff; } return Uint8Array.from([(crc>>8)&0xff,crc&0xff]); }
+
+/* ============ YC lock session (identical wire protocol to the app) ============ */
+const SERVICE='6e400001-b5a3-f393-e0a9-e50e24dcca9e', WRITE='6e400002-b5a3-f393-e0a9-e50e24dcca9e', NOTIFY='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const KEY_YC=Uint8Array.from([0,17,34,51,68,85,102,119,136,153,170,187,204,221,238,255]);
+const AAD=ascii('yulu_connect');
+function makeNonce(name){ const hx=name.replace(/^YC/i,''); const mac=[]; for(let i=0;i<6;i++) mac.push(parseInt(hx.slice(i*2,i*2+2),16)); return Uint8Array.from([0,...mac,...mac]); }
+class Session{
+  constructor(name){ this.key=Uint8Array.from(KEY_YC); this.nonce=makeNonce(name); }
+  build(dataAscii){ const data=ascii(dataAscii); const body=Uint8Array.from([0,data.length,...data]); const wc=Uint8Array.from([...body,...crc16(body)]);
+    return Uint8Array.from([...ascii('YA'),...aesCcm(this.key,this.nonce,AAD,wc,4),...ascii('ED')]); }
+  parse(frame){ const plain=aesCtr(this.key,this.nonce,Uint8Array.from(frame.subarray(2,frame.length-2)));
+    const body=plain.subarray(0,plain.length-2), crcGot=plain.subarray(plain.length-2), crcWant=crc16(body);
+    if(crcGot[0]!==crcWant[0]||crcGot[1]!==crcWant[1]) throw new Error('Lock reply failed its check — move closer and retry.');
+    const type=body[2]; const res={type,status:null,session:false,telemetry:null};
+    if(type===0x41 && body.length>=5) res.status=toAscii(body.subarray(3,5));
+    if(type===0x73){ // session-key TLV: tag 0x80, last 4 bytes patch the key
+      for(let i=7;i+2<=body.length;){ const t=body[i],len=body[i+1]; if(i+2+len>body.length)break;
+        if(t===0x80&&len>=4){ const v=body.subarray(i+2,i+2+len); for(let k=0;k<4;k++) this.key[15-k]=v[len-1-k]; res.session=true; } i+=2+len; } }
+    if((type===0x53||type===0x49)&&body.length>=7&&body[3]===0x44&&body[4]===0x52){
+      const tlvLen=((body[5]&0xff)<<8)|(body[6]&0xff); const tags={}; const end=Math.min(body.length,7+tlvLen);
+      for(let i=7;i+2<=end;){ const t=body[i],len=body[i+1]; if(i+2+len>end)break; tags[t]=body.subarray(i+2,i+2+len); i+=2+len; }
+      const be=(v,len)=>{ if(!v||v.length!==len) return undefined; let n=0; for(const x of v) n=n*256+x; return n; };
+      const tel={}; const soc=be(tags[8],1); if(soc!==undefined)tel.battery=Math.round(soc*0.5);
+      const rng=be(tags[34],2); if(rng!==undefined)tel.range=Math.round(rng)/10;
+      const spd=be(tags[36],2); if(spd!==undefined)tel.speed=Math.round(spd)/10;
+      const odo=be(tags[38],4); if(odo!==undefined)tel.odo=Math.round(odo)/10;
+      res.telemetry=tel; }
+    return res; }
+}
+/* frame reassembly YB…ED */
+const reader={ buf:[], frames:[], waiters:[],
+  push(bytes){ this.buf.push(...bytes); this.drain(); },
+  find(needle,from){ outer: for(let i=from||0;i+needle.length<=this.buf.length;i++){ for(let j=0;j<needle.length;j++) if(this.buf[i+j]!==needle[j]) continue outer; return i; } return -1; },
+  drain(){ for(;;){ const st=this.find([0x59,0x42]); if(st<0) return; const en=this.find([0x45,0x44],st+2); if(en<0) return;
+      const f=Uint8Array.from(this.buf.splice(st,en+2-st)); const w=this.waiters.shift();
+      if(w){clearTimeout(w.t); w.res(f);} else this.frames.push(f); } },
+  next(ms){ const q=this.frames.shift(); if(q) return Promise.resolve(q);
+    return new Promise((res,rej)=>{ const w={res,t:setTimeout(()=>{ this.waiters=this.waiters.filter(x=>x!==w); rej(new Error('Bike did not reply in time — move closer.')); },ms||15000)}; this.waiters.push(w); }); } };
+
+/* ============ ride state ============ */
+const frag = new URLSearchParams(location.hash.slice(1));
+const passToken = frag.get('p') || '';
+const [passId, passSecret] = passToken.split('.');
+let device=null, gatt=null, wch=null, session=null, approval=null;
+let riding=false, paused=false, kaTimer=null, kaBusy=false, wakeLock=null, odoStart=null;
+
+if(!navigator.bluetooth) $('support').textContent='⛔ This browser cannot do Bluetooth. Use Chrome on Android (not iPhone — Apple blocks Web Bluetooth there).';
+$('passinfo').innerHTML = (passId && passSecret) ? '<span class="pill">🎟️ pass loaded</span> Owner approval still required below.' : '⛔ No pass in this link. Ask the owner for a proper ride-away link.';
+
+async function transact(cmd){
+  const frame = session.build(cmd);
+  if(wch.writeValueWithoutResponse) await wch.writeValueWithoutResponse(frame); else await wch.writeValue(frame);
+  const res = session.parse(await reader.next(15000));
+  if(res.type===0x41 && res.status && !['OK','IS'].includes(res.status)) throw new Error('Bike refused "'+cmd+'" ('+res.status+').');
+  if(res.telemetry) showTele(res.telemetry);
+  return res;
+}
+function showTele(t){
+  if(t.odo!==undefined && odoStart===null && riding) odoStart=t.odo;
+  const trip = (t.odo!==undefined && odoStart!==null) ? ' · 📍 trip '+Math.max(0,Math.round((t.odo-odoStart)*10)/10)+' km' : '';
+  $('tele').textContent = '🔋 '+(t.battery??'?')+'% · 🛣️ '+(t.range??'?')+' km left · 💨 '+(t.speed??0)+' km/h · 🧭 '+(t.odo??'?')+' km'+trip;
+}
+$('choose').onclick = async () => {
+  try{
+    device = await navigator.bluetooth.requestDevice({ filters:[{namePrefix:'YC'}], optionalServices:[SERVICE] });
+    gatt = await device.gatt.connect();
+    const svc = await gatt.getPrimaryService(SERVICE);
+    wch = await svc.getCharacteristic(WRITE);
+    const nch = await svc.getCharacteristic(NOTIFY);
+    await nch.startNotifications();
+    nch.addEventListener('characteristicvaluechanged', e => reader.push(new Uint8Array(e.target.value.buffer)));
+    await new Promise(r=>setTimeout(r,700));
+    session = new Session(device.name);
+    const res = await transact('sSK');
+    if(!res.session) throw new Error('Bike did not agree a session. Try again closer.');
+    $('bikeinfo').innerHTML = '🚲 Connected: <b>'+device.name+'</b> — asking the owner now…';
+    $('unlock').disabled = false; $('ask').disabled = false;
+    await sendRequest();
+    $('bikeinfo').innerHTML = '🚲 Connected: <b>'+device.name+'</b> — request sent, waiting for the owner…';
+  }catch(e){ $('bikeinfo').textContent = '⛔ '+e.message; }
+};
+function b64urlEncode(bytes){ let bin=''; bytes.forEach(b=>bin+=String.fromCharCode(b)); return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+/* ---- relay through this page (ntfy.sh as a dumb pipe) ---- */
+let reqTopic=null, apprTopic=null;
+async function sha256HexStr(s){ const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)); return hex(new Uint8Array(d)); }
+function hexToBytes(h){ const o=new Uint8Array(h.length/2); for(let i=0;i<o.length;i++) o[i]=parseInt(h.slice(i*2,i*2+2),16); return o; }
+async function decryptRelay(text){
+  const parts = text.split('.');
+  if(parts[0] !== 'DIHH-MSG1') return text; // plain code (fallback delivery)
+  const nonce = parts[1], data = hexToBytes(parts[2]);
+  const out = new Uint8Array(data.length);
+  for(let off=0,i=0; off<data.length; off+=32,i++){
+    const ks = hexToBytes(await hmacHex(passSecret, 'DIHH-MSG1.'+nonce+'.'+i));
+    for(let j=0;j<Math.min(32,data.length-off);j++) out[off+j]=data[off+j]^ks[j];
+  }
+  return new TextDecoder().decode(out);
+}
+async function initRelay(){
+  if(!passId || !passSecret || !window.EventSource) return;
+  try{
+    reqTopic = await sha256HexStr(passId+'.'+passSecret+'.req');
+    apprTopic = await sha256HexStr(passId+'.'+passSecret+'.appr');
+    const es = new EventSource('https://ntfy.sh/'+apprTopic+'/sse');
+    es.onmessage = async (e) => {
+      try{
+        const msg = JSON.parse(e.data);
+        if(!msg || !msg.message) return;
+        const code = (await decryptRelay(String(msg.message))).trim();
+        if(!code.startsWith('DIHH-AWAY1.')) return;
+        $('code').value = code;
+        $('codeinfo').textContent = '📨 Approval just arrived from the owner — checking…';
+        await doVerify();
+      }catch(err){}
+    };
+  }catch(e){}
+}
+initRelay();
+
+async function sendRequest() {
+  try{
+    if(!device) throw new Error('Choose the bike first (step 1).');
+    if(!passId || !passSecret) throw new Error('No pass in this link.');
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(8)));
+    const payload = { v:1, passId, bike: device.name, nonce, at: Date.now() };
+    const mac = await hmacHex(passSecret, payload.passId+'.'+payload.bike+'.'+payload.nonce);
+    const code = 'DIHH-REQ1.'+b64urlEncode(new TextEncoder().encode(JSON.stringify(payload)))+'.'+mac;
+    if(reqTopic){
+      try{
+        const r = await fetch('https://ntfy.sh/'+reqTopic, { method:'POST', body: code });
+        if(r.ok){ $('reqout').value = '📨 Request sent — waiting for the owner. His approval unlocks the bike automatically, keep this page open.'; return; }
+      }catch(e){}
+    }
+    const link = 'dihh-rider://ride-request?c='+encodeURIComponent(code);
+    const text = 'Please approve my Dihh Rider ride-away request 🚀\nBike: '+payload.bike+'\nTap (opens Dihh Rider with my bike filled in): '+link+'\nOr paste this code in Dihh Rider → Me → Ride-away:\n'+code;
+    if(navigator.share){ try{ await navigator.share({ text }); return; }catch(e){ if(e && e.name==='AbortError') return; } }
+    $('reqout').value = text; $('reqout').select();
+  }catch(e){ $('reqout').value = '⛔ '+e.message; }
+}
+$('ask').onclick = sendRequest;
+async function hmacHex(key,msg){
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(key), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg));
+  return hex(new Uint8Array(sig));
+}
+async function doVerify() {
+  try{
+    const raw = $('code').value.trim();
+    const parts = raw.split('.');
+    if(parts.length!==3 || parts[0]!=='DIHH-AWAY1') throw new Error('That code does not look right — paste the whole thing.');
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1])));
+    if(payload.passId !== passId) throw new Error('This code is for a different pass.');
+    if(Date.now() > payload.exp) throw new Error('This code has expired. Ask the owner for a fresh one.');
+    const want = await hmacHex(passSecret, payload.passId+'.'+payload.bike+'.'+payload.exp);
+    if(want !== parts[2].toLowerCase()) throw new Error('Code signature does not match — the owner did not issue this.');
+    if(device && payload.bike !== device.name) throw new Error('This code is for '+payload.bike+', not '+device.name+'.');
+    approval = payload;
+    $('codeinfo').innerHTML = '✅ Owner approved <b>'+payload.bike+'</b> until '+new Date(payload.exp).toLocaleString()+'.';
+    if(device && session && !riding){ $('codeinfo').innerHTML += ' Unlocking…'; await startRideFromPage(); }
+  }catch(e){ approval=null; $('codeinfo').textContent='⛔ '+e.message; }
+}
+$('verify').onclick = doVerify;
+async function startKeepAlive(){
+  stopKeepAlive();
+  kaTimer = setInterval(async () => {
+    if(kaBusy || !riding || paused) return;
+    if(approval && Date.now() > approval.exp){ $('state').textContent='⏰ Approval expired — locking up.'; await stopRide(); return; }
+    kaBusy = true;
+    try{ await transact('CI1'); await transact('CW0'); await transact('IGS'); }catch(e){ /* a missed pulse never ends the ride; next tick retries */ }
+    kaBusy = false;
+  }, 10000);
+}
+function stopKeepAlive(){ if(kaTimer) clearInterval(kaTimer); kaTimer=null; }
+async function startRideFromPage() {
+  try{
+    if(!device || !session) throw new Error('Choose the bike first (step 1).');
+    if(!approval) throw new Error('Get the owner approval code first (step 2).');
+    if(Date.now() > approval.exp) throw new Error('Approval expired — ask the owner for a fresh code.');
+    if(approval.bike !== device.name) throw new Error('Approval is for '+approval.bike+', not this bike.');
+    if(!gatt.connected) { gatt = await device.gatt.connect(); }
+    await transact('CI1'); await transact('CW0'); await transact('IGS');
+    riding = true; paused = false; odoStart = null;
+    $('pause').disabled=false; $('end').disabled=false;
+    $('state').textContent='🟢 Riding — approved until '+new Date(approval.exp).toLocaleTimeString();
+    try{ wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+    startKeepAlive();
+  }catch(e){ $('state').textContent='⛔ '+e.message; }
+};
+$('unlock').onclick = startRideFromPage;
+$('pause').onclick = async () => {
+  if(!riding) return;
+  try{ await transact('CI1'); await transact('CI0'); paused=true; stopKeepAlive(); $('state').textContent='⏸️ Paused — tap Unlock to roll again.'; }
+  catch(e){ $('state').textContent='⛔ '+e.message; }
+};
+async function stopRide(){
+  stopKeepAlive();
+  if(riding && session){ try{ await transact('CI1'); await transact('CI0'); }catch(e){} }
+  riding=false; paused=false;
+  $('pause').disabled=true; $('end').disabled=true;
+  $('state').textContent='🏁 Ride ended. Thanks!';
+  try{ wakeLock && wakeLock.release(); }catch(e){}
+  try{ gatt && gatt.disconnect(); }catch(e){}
+}
+$('end').onclick = stopRide;
+</script>
+</body>
+</html>
